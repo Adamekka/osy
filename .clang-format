@@ -1,0 +1,53 @@
+BasedOnStyle: LLVM
+
+AlignAfterOpenBracket: BlockIndent
+AlignOperands: AlignAfterOperator
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Empty
+BinPackArguments: false
+BinPackParameters: false
+BracedInitializerIndentWidth: 4
+BreakBeforeBinaryOperators: All
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeComma
+EnumTrailingComma: Insert
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash
+IndentWidth: 4
+InsertBraces: true
+InsertNewlineAtEOF: true
+InsertTrailingCommas: Wrapped
+KeepEmptyLines:
+  AtEndOfFile: false
+  AtStartOfBlock: false
+  AtStartOfFile: false
+LineEnding: LF
+MaxEmptyLinesToKeep: 1
+NamespaceIndentation: None
+NumericLiteralCase:
+  ExponentLetter: Lower
+  HexDigit: Upper
+  Prefix: Lower
+  Suffix: Lower
+PointerAlignment: Left
+QualifierAlignment: Left
+ReferenceAlignment: Left
+RemoveBracesLLVM: false
+RemoveEmptyLinesInUnwrappedLines: true
+RemoveParentheses: ReturnStatement
+RemoveSemicolon: true
+SeparateDefinitionBlocks: Always
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCaseColon: false
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: false
+SpaceBeforeInheritanceColon: false
+SpaceBeforeJsonColon: false
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceBeforeSquareBrackets: false
+SpaceInEmptyBraces: Never
+SpacesInContainerLiterals: false
+UseTab: Never

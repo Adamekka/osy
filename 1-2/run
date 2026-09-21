@@ -1,0 +1,4 @@
+#!/bin/sh
+
+printf 'Hello AbC!\n' | LD_LIBRARY_PATH="$PWD/dynamic_upper" ./transform-dynamic
+printf 'Hello AbC!\n' | LD_LIBRARY_PATH="$PWD/dynamic_lower" ./transform-dynamic
