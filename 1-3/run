@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -eu
+
+make
+
+cd "$(dirname "$0")"
+export LD_LIBRARY_PATH="$PWD"
+
+# Isolate test files so an existing log is never overwritten or deleted.
+test_dir=$(mktemp -d)
+trap 'rm -rf "$test_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+
+printf 'server started\n' > "$test_dir/server.log"
+ln -s server.log "$test_dir/latest.log"
+
+for mode in 600 644 755 000; do
+    chmod "$mode" "$test_dir/server.log"
+    printf '\nAccess with mode %s:\n' "$mode"
+    ./log_check -a "$test_dir/server.log"
+done
+
+# Restore read permission so open() in the fstat test can succeed.
+chmod 644 "$test_dir/server.log"
+
+printf '\nstat on a regular file:\n'
+./log_check -s "$test_dir/server.log"
+printf '\n\nlstat on a regular file:\n'
+./log_check -l "$test_dir/server.log"
+printf '\n\nlstat on a symbolic link:\n'
+./log_check -l "$test_dir/latest.log"
+printf '\n\nfstat on a regular file:\n'
+./log_check -f "$test_dir/server.log"
+printf '\n'
