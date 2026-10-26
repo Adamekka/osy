@@ -1,12 +1,12 @@
 CC = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -Wpedantic
+CXXFLAGS = -std=c++20 -Wall -Wextra -Wpedantic -pthread
 
 .PHONY: all clean
 
 ifeq ($(shell uname -s),Darwin)
 # The supplied Linux library cannot be linked by the macOS linker.
 all:
-	docker build --platform linux/amd64 -t osy-2-1-test .
+	docker build --platform linux/amd64 -t osy-2-2 .
 else
 
 # MARK: Binaries

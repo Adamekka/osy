@@ -1,27 +1,59 @@
 #include "io.hpp"
 #include "zoo_map.hpp"
 #include <cassert>
-#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 // Keep the original protocol limit of 1023 bytes per command.
 constexpr auto record_capacity{size_t{1024}};
 uint8_t zoo_map[map_size][map_size];
 bool debug = false;
 
+// Global storage is shared by all client threads. Synchronization comes in
+// the next assignment, so concurrent changes are not safe yet.
+auto clients{std::vector<int32_t>{}};
+
 // Keep one buffer per connection. Unread bytes start at position.
 struct InputBuffer final {
     std::string bytes;
     size_t position{0};
 };
+
+auto broadcast_message(
+    const int32_t source_descriptor,
+    const std::string& name,
+    const std::string& text
+) -> void {
+    const auto message{name + ": " + text + "\n"};
+    std::fputs(message.c_str(), stdout);
+    for (const auto client_socket : clients) {
+        // if dest != src
+        if (client_socket != source_descriptor) {
+            write_all(client_socket, message);
+        }
+    }
+}
+
+auto serve_console([[maybe_unused]] void* const argument) -> void* {
+    auto text{std::string{}};
+    while (std::getline(std::cin, text)) {
+        // stdin has its own open descriptor, so every client receives this.
+        broadcast_message(STDIN_FILENO, "Server", text);
+    }
+    assert(std::cin.eof());
+    // Console EOF ends this thread while the server keeps accepting clients.
+    return nullptr;
+}
 
 // Return a listening socket for 127.0.0.1:12345. The caller owns the
 // descriptor; accept() will create separate descriptors for individual
@@ -109,8 +141,6 @@ struct InputBuffer final {
 
 // Run one external query and wait for its output. Keep the visitor's socket
 // open so serve_player can handle the next command after this function returns.
-// Requires SIGCHLD's default behavior, restored in the connection child in
-// main.
 auto send_animal_info(const int32_t client_socket, const std::string& animal)
     -> void {
     const auto info_child{fork()};
@@ -168,9 +198,15 @@ auto send_animal_info(const int32_t client_socket, const std::string& animal)
     return area;
 }
 
-// Run in a connection child. State belongs to one visitor, and HELLO must fill
-// it before other commands use it. The caller closes the socket on return.
-auto serve_player(const int32_t client_socket) -> void {
+// Run in a client thread. Local session state belongs to this visitor;
+// the map and open sockets are shared by all threads.
+auto serve_player(void* const argument) -> void* {
+    const auto* const socket_argument{static_cast<const int32_t*>(argument)};
+    const auto client_socket{*socket_argument};
+    // The socket number is copied, so the heap argument is no longer needed.
+    delete socket_argument;
+
+    clients.emplace_back(client_socket);
     std::printf("[%d] Client connected\n", getpid());
     auto input{InputBuffer{}};
     auto command{std::string{}};
@@ -189,7 +225,13 @@ auto serve_player(const int32_t client_socket) -> void {
         if (registered) {
             if (command == "QUIT") {
                 write_all(client_socket, "BYE " + name + "\n");
-                return;
+                break;
+            }
+            if (command.starts_with("MSG ")) {
+                // Preserve the text after the four-byte "MSG " prefix.
+                broadcast_message(client_socket, name, command.substr(4));
+                // Chat does not change position, so skip the position reply.
+                continue;
             }
             if (command.starts_with("INFO ")) {
                 if (arguments.size() == 2) {
@@ -224,8 +266,8 @@ auto serve_player(const int32_t client_socket) -> void {
             }
             name = arguments[1];
 
-            // fork copies PRNG state, so seed each visitor with its own PID.
-            std::srand(static_cast<uint32_t>(getpid()));
+            // All threads share the PRNG, which main seeds once before starting
+            // them.
             x = std::rand() % map_size;
             y = std::rand() % map_size;
             registered = true;
@@ -245,12 +287,29 @@ auto serve_player(const int32_t client_socket) -> void {
             std::printf("[%d] Reply: %s", getpid(), response.c_str());
         }
         write_all(client_socket, response);
+
+        if (command.starts_with("HELLO ") || command.starts_with("MOVE ")) {
+            // Text notices preserve each recipient's own POS/map state.
+            broadcast_message(
+                client_socket,
+                name,
+                "position (" + std::to_string(x) + "," + std::to_string(y) + ")"
+            );
+        }
     }
+
+    // Remove the socket before closing it, because the OS can reuse its number.
+    const auto removed{std::erase(clients, client_socket)};
+    assert(removed == 1);
+    std::printf("[%d] Client disconnected\n", getpid());
+    close(client_socket);
+    // Returning from the pthread entry function ends only this thread.
+    return nullptr;
 }
 
-// The parent only accepts and forks. Each child runs one visitor session.
+// The main thread accepts connections; each client gets its own thread.
 auto main(const int32_t argc, char** const argv) -> int {
-    // Flush logs before forking so buffered output is not printed twice.
+    // Line-buffer logs so each completed line appears immediately.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::srand(static_cast<uint32_t>(getpid()));
 
@@ -266,10 +325,14 @@ auto main(const int32_t argc, char** const argv) -> int {
 
     const auto server_socket{create_server_socket()};
 
-    // Explicitly ignoring SIGCHLD lets the OS collect exited children instead
-    // of leaving zombies while this parent waits for new connections.
-    const auto child_signal_result{std::signal(SIGCHLD, SIG_IGN)};
-    assert(child_signal_result != SIG_ERR);
+    // Read the keyboard separately so main can keep accepting clients.
+    auto console_thread{pthread_t{}};
+    const auto console_create_result{
+        pthread_create(&console_thread, nullptr, serve_console, nullptr)
+    };
+    assert(console_create_result == 0);
+    const auto console_detach_result{pthread_detach(console_thread)};
+    assert(console_detach_result == 0);
 
     while (true) {
         // accept returns a new socket for one visitor and keeps the listener.
@@ -277,32 +340,18 @@ auto main(const int32_t argc, char** const argv) -> int {
         const auto client_socket{accept(server_socket, nullptr, nullptr)};
         assert(client_socket != -1);
 
-        // Both processes continue here: the child gets 0, the parent gets its
-        // PID. Their separate descriptor tables refer to the same underlying
-        // sockets.
-        const auto child{fork()};
-        assert(child != -1);
+        auto thread{pthread_t{}};
+        // Heap storage keeps the argument alive after this loop advances.
+        const auto create_result{pthread_create(
+            &thread, nullptr, serve_player, new int32_t{client_socket}
+        )};
+        assert(create_result == 0);
 
-        if (child == 0) {
-            // Only the parent accepts connections; closing this copy leaves
-            // the parent's listening socket open.
-            close(server_socket);
+        // No thread result is needed; detach releases its resources on exit.
+        const auto detach_result{pthread_detach(thread)};
+        assert(detach_result == 0);
 
-            // The parent auto-reaps visitors, but this child must wait for
-            // zoo_info.
-            const auto info_signal_result{std::signal(SIGCHLD, SIG_DFL)};
-            assert(info_signal_result != SIG_ERR);
-
-            serve_player(client_socket);
-            std::printf("[%d] Client disconnected\n", getpid());
-            close(client_socket);
-
-            // End this child instead of returning to the parent's accept loop.
-            return 0;
-        }
-
-        // Keeping this copy open would prevent the client from seeing EOF when
-        // the child closes its copy. Release it and accept the next visitor.
-        close(client_socket);
+        // Threads share descriptors, so only the client thread closes its
+        // socket.
     }
 }
