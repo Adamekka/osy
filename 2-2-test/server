@@ -1,0 +1,2 @@
+#!/bin/sh
+docker run --rm -it --name osy-zoo-2-2-test osy-2-2-test ./zoo "$@"
