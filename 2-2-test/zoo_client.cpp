@@ -7,10 +7,139 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
-#include <poll.h>
+#include <pthread.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+
+// The keyboard updates this state, needs to be global
+auto movement_thread{pthread_t{}};
+auto movement_running{false};
+
+// This thread receives replies from the server and updates the map
+auto receive_messages(void* const argument) -> void* {
+    const auto server_socket{*static_cast<const int32_t*>(argument)};
+    auto buffer{std::string(1024, '\0')};
+    auto pending{std::string{}};
+
+    while (true) {
+        const auto received_len{
+            read(server_socket, buffer.data(), buffer.size())
+        };
+        assert(received_len >= 0);
+        if (received_len == 0) {
+            return nullptr;
+        }
+        pending.append(buffer, 0, static_cast<size_t>(received_len));
+        while (true) {
+            const auto newline{pending.find('\n')};
+            if (newline == std::string::npos) {
+                break;
+            }
+            const auto line{pending.substr(0, newline)};
+            pending.erase(0, newline + 1);
+            std::puts(line.c_str());
+
+            const auto fields{split_words(line)};
+            const auto is_player{fields.size() == 4 && fields[0] == "PLAYER"};
+            if (!is_player
+                && (fields.size() < 5 || fields[0] != "POS"
+                    || fields[3] != "AREA")) {
+                continue;
+            }
+
+            // PLAYER includes a name before x/y, POS starts with x/y.
+            int32_t x;
+            const auto& x_text{fields[is_player ? 2 : 1]};
+            const auto x_end{x_text.data() + x_text.size()};
+            const auto x_result{std::from_chars(x_text.data(), x_end, x)};
+            if (x_result.ec != std::errc{} || x_result.ptr != x_end) {
+                continue;
+            }
+
+            int32_t y;
+            const auto& y_text{fields[is_player ? 3 : 2]};
+            const auto y_end{y_text.data() + y_text.size()};
+            const auto y_result{std::from_chars(y_text.data(), y_end, y)};
+            if (y_result.ec != std::errc{} || y_result.ptr != y_end) {
+                continue;
+            }
+
+            if (is_player) {
+                update_other_player(fields[1].c_str(), x, y);
+            } else {
+                update_map(x, y, fields[4].c_str());
+            }
+            draw_map();
+        }
+    }
+}
+
+auto move_randomly(void* const argument) -> void* {
+    const auto server_socket{*static_cast<const int32_t*>(argument)};
+    const std::string moves[]{
+        "MOVE NORTH\n", "MOVE SOUTH\n", "MOVE WEST\n", "MOVE EAST\n"
+    };
+
+    while (true) {
+        sleep(5);
+        write_all(server_socket, moves[std::rand() % 4]);
+    }
+}
+
+auto stop_movement() -> void {
+    if (!movement_running) {
+        return;
+    }
+
+    const auto cancelled{pthread_cancel(movement_thread)};
+    assert(cancelled == 0);
+    const auto joined{pthread_join(movement_thread, nullptr)};
+    assert(joined == 0);
+    movement_running = false;
+}
+
+// This thread reads the keyboard and sends commands to the server
+auto send_commands(void* const argument) -> void* {
+    const auto server_socket{*static_cast<const int32_t*>(argument)};
+    auto command{std::string{}};
+
+    while (std::getline(std::cin, command)) {
+        if (command == "START") {
+            if (!movement_running) {
+                const auto created{pthread_create(
+                    &movement_thread, nullptr, move_randomly, argument
+                )};
+                assert(created == 0);
+                movement_running = true;
+            }
+            continue;
+        }
+        if (command == "STOP") {
+            stop_movement();
+            continue;
+        }
+
+        if (command == "w" || command == "W") {
+            command = "MOVE NORTH";
+        } else if (command == "s" || command == "S") {
+            command = "MOVE SOUTH";
+        } else if (command == "a" || command == "A") {
+            command = "MOVE WEST";
+        } else if (command == "d" || command == "D") {
+            command = "MOVE EAST";
+        }
+
+        // getline removes '\n', add it back to the end
+        write_all(server_socket, command + "\n");
+    }
+    assert(std::cin.eof());
+
+    stop_movement();
+    const auto shutdown_result{shutdown(server_socket, SHUT_WR)};
+    assert(shutdown_result == 0);
+    return nullptr;
+}
 
 // Prompt for the name, then forward commands and draw received map areas.
 auto main(const int32_t argc, char** const argv) -> int {
@@ -23,7 +152,8 @@ auto main(const int32_t argc, char** const argv) -> int {
     // Reject trailing text as well as ports outside the TCP port range.
     assert(*port_end == '\0' && port > 0 && port <= 65535);
 
-    const auto server_socket{socket(AF_INET, SOCK_STREAM, 0)};
+    // pthread_create takes void*, so this argument storage is non-const.
+    auto server_socket{socket(AF_INET, SOCK_STREAM, 0)};
     assert(server_socket != -1);
 
     auto address{sockaddr_in{}};
@@ -43,9 +173,6 @@ auto main(const int32_t argc, char** const argv) -> int {
 
     std::fputs("Jméno: ", stdout);
     std::fflush(stdout);
-    // Keep synchronized std::cin unbuffered so poll can read later piped
-    // commands.
-    std::setvbuf(stdin, nullptr, _IONBF, 0);
     auto name{std::string{}};
     const auto name_read{static_cast<bool>(std::getline(std::cin, name))};
     assert(name_read);
@@ -54,100 +181,35 @@ auto main(const int32_t argc, char** const argv) -> int {
     }
     write_all(server_socket, "HELLO " + name + "\n");
 
-    // events asks for readiness; poll() writes the result flags into revents.
-    pollfd events[]{
-        // events[0] watches keyboard input; events[1] watches server replies.
-        {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
-        {.fd = server_socket, .events = POLLIN, .revents = 0}
-    };
-    // One scratch buffer is enough because the two reads are handled in turn.
-    auto buffer{std::string(1024, '\0')};
-    auto pending{std::string{}};
-
-    const std::string moves[]{
-        "MOVE NORTH\n", "MOVE SOUTH\n", "MOVE WEST\n", "MOVE EAST\n"
-    };
-    // Seed once so each client process has its own random movement sequence.
     std::srand(static_cast<uint32_t>(getpid()));
 
-    while (true) {
-        // Each event starts a new five-second wait, including a server reply.
-        // After stdin EOF, wait only for replies because sending is shut down.
-        const auto poll_result{poll(events, 2, events[0].fd < 0 ? -1 : 5000)};
-        assert(poll_result >= 0);
+    // Start GET SERVER_DATA
+    auto receiver{pthread_t{}};
+    const auto receiver_created{
+        pthread_create(&receiver, nullptr, receive_messages, &server_socket)
+    };
+    assert(receiver_created == 0);
 
-        // Zero means neither descriptor became ready within five seconds.
-        if (poll_result == 0) {
-            write_all(server_socket, moves[std::rand() % 4]);
-            continue;
-        }
+    // Start GET KEYBOARD, SET SERVER_DATA
+    auto keyboard{pthread_t{}};
+    const auto keyboard_created{
+        pthread_create(&keyboard, nullptr, send_commands, &server_socket)
+    };
+    assert(keyboard_created == 0);
 
-        // revents is a bit mask, so several flags can be present at once.
-        // Hangups can still have buffered data; read it before checking EOF.
-        if (events[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            const auto received{
-                read(server_socket, buffer.data(), buffer.size())
-            };
-            assert(received >= 0);
-            if (received == 0) {
-                break;
-            }
-            // TCP can split a reply or combine several replies in one read.
-            pending.append(buffer, 0, static_cast<size_t>(received));
-            while (true) {
-                const auto newline{pending.find('\n')};
-                if (newline == std::string::npos) {
-                    break;
-                }
-                const auto line{pending.substr(0, newline)};
-                pending.erase(0, newline + 1);
-                std::puts(line.c_str());
+    // Wait for server to shut down
+    const auto receiver_joined{pthread_join(receiver, nullptr)};
+    assert(receiver_joined == 0);
 
-                const auto fields{split_words(line)};
-                if (fields.size() < 5 || fields[0] != "POS" || fields[3] != "AREA") {
-                    continue;
-                }
+    // Tell keyboard to shut down
+    const auto keyboard_cancelled{pthread_cancel(keyboard)};
+    assert(keyboard_cancelled == 0);
 
-                // Reject trailing text because from_chars also accepts numeric prefixes.
-                int32_t x;
-                const auto& x_text{fields[1]};
-                const auto x_end{x_text.data() + x_text.size()};
-                const auto x_result{std::from_chars(x_text.data(), x_end, x)};
-                if (x_result.ec != std::errc{} || x_result.ptr != x_end) {
-                    continue;
-                }
+    // Wait for keyboard to shut down
+    const auto keyboard_joined{pthread_join(keyboard, nullptr)};
+    assert(keyboard_joined == 0);
 
-                int32_t y;
-                const auto& y_text{fields[2]};
-                const auto y_end{y_text.data() + y_text.size()};
-                const auto y_result{std::from_chars(y_text.data(), y_end, y)};
-                if (y_result.ec != std::errc{} || y_result.ptr != y_end) {
-                    continue;
-                }
-
-                update_map(x, y, fields[4].c_str());
-                draw_map();
-            }
-        }
-
-        if (events[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            const auto typed{read(STDIN_FILENO, buffer.data(), buffer.size())};
-            assert(typed >= 0);
-            if (typed == 0) {
-                // End outgoing input, but keep receiving the server's replies.
-                const auto shutdown_result{shutdown(server_socket, SHUT_WR)};
-                assert(shutdown_result == 0);
-                // poll ignores negative descriptors, preventing repeated EOF
-                // reads.
-                events[0].fd = -1;
-            } else {
-                write_all(
-                    server_socket, buffer.substr(0, static_cast<size_t>(typed))
-                );
-            }
-        }
-    }
-
+    stop_movement();
     close(server_socket);
     return 0;
 }

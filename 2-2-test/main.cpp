@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <list>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -12,16 +13,28 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vector>
 
-// Keep the original protocol limit of 1023 bytes per command.
 constexpr auto record_capacity{size_t{1024}};
 uint8_t zoo_map[map_size][map_size];
 bool debug = false;
 
-// Global storage is shared by all client threads. Synchronization comes in
-// the next assignment, so concurrent changes are not safe yet.
-auto clients{std::vector<int32_t>{}};
+struct Client final {
+    int32_t socket;
+    int32_t x;
+    int32_t y;
+    std::string name;
+};
+
+auto clients{std::list<Client>{}};
+
+auto send_player_position(const int32_t destination, const Client& player)
+    -> void {
+    write_all(
+        destination,
+        "PLAYER " + player.name + " " + std::to_string(player.x) + " "
+            + std::to_string(player.y) + "\n"
+    );
+}
 
 // Keep one buffer per connection. Unread bytes start at position.
 struct InputBuffer final {
@@ -36,10 +49,10 @@ auto broadcast_message(
 ) -> void {
     const auto message{name + ": " + text + "\n"};
     std::fputs(message.c_str(), stdout);
-    for (const auto client_socket : clients) {
+    for (const auto& client : clients) {
         // if dest != src
-        if (client_socket != source_descriptor) {
-            write_all(client_socket, message);
+        if (client.socket != source_descriptor) {
+            write_all(client.socket, message);
         }
     }
 }
@@ -206,13 +219,17 @@ auto serve_player(void* const argument) -> void* {
     // The socket number is copied, so the heap argument is no longer needed.
     delete socket_argument;
 
-    clients.emplace_back(client_socket);
+    auto& client{clients.emplace_back(
+        Client{
+            client_socket,
+            std::rand() % map_size,
+            std::rand() % map_size,
+            std::string{}
+        }
+    )};
     std::printf("[%d] Client connected\n", getpid());
     auto input{InputBuffer{}};
     auto command{std::string{}};
-    auto name{std::string{}};
-    int32_t x;
-    int32_t y;
     auto registered{false};
 
     while (read_command(client_socket, input, command)) {
@@ -224,12 +241,14 @@ auto serve_player(void* const argument) -> void* {
 
         if (registered) {
             if (command == "QUIT") {
-                write_all(client_socket, "BYE " + name + "\n");
+                write_all(client_socket, "BYE " + client.name + "\n");
                 break;
             }
             if (command.starts_with("MSG ")) {
                 // Preserve the text after the four-byte "MSG " prefix.
-                broadcast_message(client_socket, name, command.substr(4));
+                broadcast_message(
+                    client_socket, client.name, command.substr(4)
+                );
                 // Chat does not change position, so skip the position reply.
                 continue;
             }
@@ -240,66 +259,92 @@ auto serve_player(void* const argument) -> void* {
                 continue;
             }
 
+            auto next_x{client.x};
+            auto next_y{client.y};
+
             // Preserve the original directions. A move at an edge stays put.
             if (command == "MOVE NORTH") {
-                if (y < map_size - 1) {
-                    ++y;
+                if (next_y < map_size - 1) {
+                    ++next_y;
                 }
             } else if (command == "MOVE SOUTH") {
-                if (y > 0) {
-                    --y;
+                if (next_y > 0) {
+                    --next_y;
                 }
             } else if (command == "MOVE EAST") {
-                if (x < map_size - 1) {
-                    ++x;
+                if (next_x < map_size - 1) {
+                    ++next_x;
                 }
             } else if (command == "MOVE WEST") {
-                if (x > 0) {
-                    --x;
+                if (next_x > 0) {
+                    --next_x;
                 }
             } else if (command != "WHERE" && command != "AREA") {
                 continue;
+            }
+
+            auto occupied{false};
+            for (const auto& other : clients) {
+                if (other.socket != client_socket && other.x == next_x
+                    && other.y == next_y) {
+                    occupied = true;
+                    break;
+                }
+            }
+            if (!occupied) {
+                client.x = next_x;
+                client.y = next_y;
             }
         } else {
             if (!command.starts_with("HELLO ") || arguments.size() != 2) {
                 continue;
             }
-            name = arguments[1];
+            client.name = arguments[1];
 
-            // All threads share the PRNG, which main seeds once before starting
-            // them.
-            x = std::rand() % map_size;
-            y = std::rand() % map_size;
             registered = true;
             write_all(
                 client_socket,
-                "WELCOME " + name + " (" + std::to_string(x) + ","
-                    + std::to_string(y) + ")\n"
+                "WELCOME " + client.name + " (" + std::to_string(client.x) + ","
+                    + std::to_string(client.y) + ")\n"
             );
         }
 
         const auto response{
-            "POS " + std::to_string(x) + " " + std::to_string(y) + " AREA "
-            + send_area(x, y) + "\n"
+            "POS " + std::to_string(client.x) + " " + std::to_string(client.y)
+            + " AREA " + send_area(client.x, client.y) + "\n"
         };
-        std::printf("[%d] %s at (%d,%d)\n", getpid(), name.c_str(), x, y);
+        std::printf(
+            "[%d] %s at (%d,%d)\n",
+            getpid(),
+            client.name.c_str(),
+            client.x,
+            client.y
+        );
         if (debug) {
             std::printf("[%d] Reply: %s", getpid(), response.c_str());
         }
         write_all(client_socket, response);
 
         if (command.starts_with("HELLO ") || command.starts_with("MOVE ")) {
-            // Text notices preserve each recipient's own POS/map state.
-            broadcast_message(
-                client_socket,
-                name,
-                "position (" + std::to_string(x) + "," + std::to_string(y) + ")"
-            );
+            for (const auto& other : clients) {
+                // A name means HELLO completed
+                if (other.socket != client_socket && !other.name.empty()) {
+                    send_player_position(other.socket, client);
+                    // A new player needs the ones already here
+                    if (command.starts_with("HELLO ")) {
+                        send_player_position(client_socket, other);
+                    }
+                }
+            }
         }
     }
 
     // Remove the socket before closing it, because the OS can reuse its number.
-    const auto removed{std::erase(clients, client_socket)};
+    const auto removed{
+        std::erase_if(clients, [client_socket](const auto& entry) {
+            return entry.socket == client_socket;
+        })
+    };
     assert(removed == 1);
     std::printf("[%d] Client disconnected\n", getpid());
     close(client_socket);
