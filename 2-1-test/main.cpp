@@ -5,23 +5,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <netinet/in.h>
 #include <poll.h>
+#include <string>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-// The final byte is reserved for '\0' in a parsed command.
+// Keep the original protocol limit of 1023 bytes per command.
 constexpr auto record_capacity{size_t{1024}};
-uint8_t map[map_size * map_size];
+uint8_t zoo_map[map_size][map_size];
 bool debug = false;
 
-// Keep one buffer per connection. Unread bytes are in [position, length).
+// Keep one buffer per connection. Unread bytes start at position.
 struct InputBuffer final {
-    char bytes[record_capacity]; // read() fills raw bytes without a terminator.
+    std::string bytes;
     size_t position{0};
-    size_t length{0};
 };
 
 // Return a listening socket for 127.0.0.1:12345. The caller owns the
@@ -50,30 +49,28 @@ struct InputBuffer final {
     return server_socket;
 }
 
-// Return one command without '\n', terminated with '\0', or false on EOF.
-// Keep input between calls. The array reference preserves command's capacity.
+// Return one command without '\n', or false on EOF. Keep unread input.
 [[nodiscard]] auto read_command(
-    const int32_t client_socket,
-    InputBuffer& input,
-    char (&command)[record_capacity]
+    const int32_t client_socket, InputBuffer& input, std::string& command
 ) -> bool {
     auto client_event{
         pollfd{.fd = client_socket, .events = POLLIN, .revents = 0}
     };
-    auto used{size_t{0}};
+    command.clear();
     auto discard_command{false};
 
     while (true) {
         // Reuse unread bytes before polling again. One read may contain several
         // commands, and returning one command must preserve the remaining
         // bytes.
-        if (input.position == input.length) {
+        if (input.position == input.bytes.size()) {
             // -1 waits indefinitely; read() then distinguishes data from EOF.
             const auto poll_result{poll(&client_event, 1, -1)};
             assert(poll_result > 0);
 
+            input.bytes.resize(record_capacity);
             const auto received{
-                read(client_socket, input.bytes, sizeof(input.bytes))
+                read(client_socket, input.bytes.data(), input.bytes.size())
             };
             assert(received >= 0);
             if (received == 0) {
@@ -82,7 +79,7 @@ struct InputBuffer final {
             }
 
             input.position = 0;
-            input.length = static_cast<size_t>(received);
+            input.bytes.resize(static_cast<size_t>(received));
         }
 
         const auto byte{input.bytes[input.position++]};
@@ -96,19 +93,17 @@ struct InputBuffer final {
         }
 
         if (byte == '\n') {
-            command[used] = '\0';
             return true;
         }
 
-        // Reserve space for '\0'. Oversized lines and embedded terminators are
-        // invalid input, so discard the line and let the visitor try again.
-        if (used == sizeof(command) - 1 || byte == '\0') {
-            used = 0;
+        // Discard the whole invalid line so its suffix cannot become a command.
+        if (command.size() == record_capacity - 1 || byte == '\0') {
+            command.clear();
             discard_command = true;
             continue;
         }
 
-        command[used++] = byte;
+        command += byte;
     }
 }
 
@@ -116,7 +111,7 @@ struct InputBuffer final {
 // open so serve_player can handle the next command after this function returns.
 // Requires SIGCHLD's default behavior, restored in the connection child in
 // main.
-auto send_animal_info(const int32_t client_socket, const char* const animal)
+auto send_animal_info(const int32_t client_socket, const std::string& animal)
     -> void {
     const auto info_child{fork()};
     assert(info_child != -1);
@@ -131,7 +126,12 @@ auto send_animal_info(const int32_t client_socket, const char* const animal)
         // argv[0] is the program name, argv[1] is animal; nullptr ends the
         // list. The relative executable path is resolved from the server's
         // working dir.
-        execl("./zoo_info", "zoo_info", animal, static_cast<char*>(nullptr));
+        execl(
+            "./zoo_info",
+            "zoo_info",
+            animal.c_str(),
+            static_cast<char*>(nullptr)
+        );
         // Success replaces this process. On failure, stop even if asserts are
         // off.
         assert(false && "execl zoo_info failed");
@@ -144,210 +144,125 @@ auto send_animal_info(const int32_t client_socket, const char* const animal)
     assert(waited == info_child);
 }
 
-auto send_area(int x, int y, char area[]) -> void {
-    int index = 0;
+[[nodiscard]] auto send_area(const int32_t x, const int32_t y) -> std::string {
+    auto area{std::string{}};
 
     for (auto dy{int32_t{-1}}; dy <= 1; dy++) {
         for (auto dx{int32_t{-1}}; dx <= 1; dx++) {
-            int nx = x + dx;
-            int ny = y + dy;
+            const auto nx{x + dx};
+            const auto ny{y + dy};
+            // Zero marks a cell outside the map.
+            const auto value{
+                nx >= 0 && nx < map_size && ny >= 0 && ny < map_size
+                    ? zoo_map[ny][nx]
+                    : uint8_t{0}
+            };
 
-            int value = 0;
-            if (nx >= 0 && nx < map_size && ny >= 0 && ny < map_size) {
-                value = map[ny * map_size + nx];
+            if (!area.empty()) {
+                area += ',';
             }
 
-            if (index > 0) {
-                area[index++] = ',';
-            }
-
-            area[index++] = '0' + value;
+            area += std::to_string(value);
         }
     }
-    area[index] = '\0';
-}
-
-auto get_map_str(char map_str[]) -> void {
-    int index = 0;
-
-    for (auto dy{int32_t{0}}; dy < map_size; dy++) {
-        for (auto dx{int32_t{0}}; dx < map_size; dx++) {
-            int nx = dx;
-            int ny = dy;
-
-            int value = map[ny * map_size + nx];
-
-            if (index > 0) {
-                map_str[index++] = ',';
-            }
-
-            map_str[index++] = '0' + value;
-        }
-    }
-
-    map_str[index] = '\0';
+    return area;
 }
 
 // Run in a connection child. State belongs to one visitor, and HELLO must fill
 // it before other commands use it. The caller closes the socket on return.
 auto serve_player(const int32_t client_socket) -> void {
-    std::puts("Client connected");
-
-    // Keep unread bytes between read_command calls, including after a newline.
+    std::printf("[%d] Client connected\n", getpid());
     auto input{InputBuffer{}};
-    char command[record_capacity];
-
-    // HELLO fills these fields once; they persist for later commands.
-    char name[record_capacity];
+    auto command{std::string{}};
+    auto name{std::string{}};
     int32_t x;
     int32_t y;
     auto registered{false};
 
-    write_all(
-        client_socket, "Zadej jmeno", static_cast<size_t>(sizeof("Zadej jmeno"))
-    );
-
     while (read_command(client_socket, input, command)) {
-        std::printf("Command: %s\n", command);
+        if (debug) {
+            std::printf("[%d] Command: %s\n", getpid(), command.c_str());
+        }
 
-        // Leave room for the longer WELCOME reply as well as the shorter POS.
-        char response[sizeof(name) + 256];
-        int32_t formatted;
+        const auto arguments{split_words(command)};
+
         if (registered) {
-            if (std::strcmp(command, "QUIT") == 0) {
-                formatted = std::snprintf(
-                    response, sizeof(response), "BYE %s\n", name
-                );
-                assert(formatted > 0);
-                write_all(
-                    client_socket, response, static_cast<size_t>(formatted)
-                );
-                // main closes this visitor's socket and exits the child.
+            if (command == "QUIT") {
+                write_all(client_socket, "BYE " + name + "\n");
                 return;
             }
-
-            if (std::strncmp(command, "INFO ", 5) == 0) {
-                char animal[record_capacity];
-                char extra;
-                // A second conversion detects extra arguments, as with HELLO.
-                const auto matched{
-                    std::sscanf(command, "INFO %1023s %c", animal, &extra)
-                };
-                if (matched != 1) {
-                    continue;
+            if (command.starts_with("INFO ")) {
+                if (arguments.size() == 2) {
+                    send_animal_info(client_socket, arguments[1]);
                 }
-
-                send_animal_info(client_socket, animal);
-                // The helper sent the reply; skip the common POS reply below.
                 continue;
             }
 
-            // NORTH increases y; EAST increases x. WHERE uses the same POS
-            // reply. At an edge, keep the coordinate unchanged and still reply
-            // POS.
-            if (std::strcmp(command, "MOVE NORTH") == 0) {
+            // Preserve the original directions. A move at an edge stays put.
+            if (command == "MOVE NORTH") {
                 if (y < map_size - 1) {
                     ++y;
                 }
-
-                formatted = std::snprintf(
-                    response, sizeof(response), "POS %d %d\n", x, y
-                );
-            } else if (std::strcmp(command, "MOVE SOUTH") == 0) {
+            } else if (command == "MOVE SOUTH") {
                 if (y > 0) {
                     --y;
                 }
-
-                formatted = std::snprintf(
-                    response, sizeof(response), "POS %d %d\n", x, y
-                );
-            } else if (std::strcmp(command, "MOVE EAST") == 0) {
+            } else if (command == "MOVE EAST") {
                 if (x < map_size - 1) {
                     ++x;
                 }
-
-                formatted = std::snprintf(
-                    response, sizeof(response), "POS %d %d\n", x, y
-                );
-            } else if (std::strcmp(command, "MOVE WEST") == 0) {
+            } else if (command == "MOVE WEST") {
                 if (x > 0) {
                     --x;
                 }
-
-                formatted = std::snprintf(
-                    response, sizeof(response), "POS %d %d\n", x, y
-                );
-            } else if (std::strcmp(command, "AREA") == 0) {
-                char area[18];
-                send_area(x, y, area);
-
-                formatted = std::snprintf(
-                    response,
-                    sizeof(response),
-                    "POS %d %d AREA %s\n",
-                    x,
-                    y,
-                    area
-                );
-
-            } else if (std::strcmp(command, "WHERE") == 0) {
-                formatted = std::snprintf(
-                    response, sizeof(response), "POS %d %d\n", x, y
-                );
-            } else {
+            } else if (command != "WHERE" && command != "AREA") {
                 continue;
             }
         } else {
-            // Require HELLO followed by a space and one name. A second
-            // conversion detects extra arguments; the width leaves room for
-            // the terminator.
-            char extra;
-            const auto matched{
-                std::sscanf(command, "HELLO %1023s %c", name, &extra)
-            };
-            if (std::strncmp(command, "HELLO ", 6) != 0 || matched != 1) {
-                // Stay unregistered so a bad command permits a valid retry.
+            if (!command.starts_with("HELLO ") || arguments.size() != 2) {
                 continue;
             }
+            name = arguments[1];
 
             // fork copies PRNG state, so seed each visitor with its own PID.
             std::srand(static_cast<uint32_t>(getpid()));
             x = std::rand() % map_size;
             y = std::rand() % map_size;
             registered = true;
-
-            formatted = std::snprintf(
-                response, sizeof(response), "WELCOME %s (%d,%d)\n", name, x, y
+            write_all(
+                client_socket,
+                "WELCOME " + name + " (" + std::to_string(x) + ","
+                    + std::to_string(y) + ")\n"
             );
         }
 
-        assert(formatted > 0);
-        // snprintf counts the text bytes and excludes the terminating '\0'.
-        // write_all(client_socket, response, static_cast<size_t>(formatted));
-        char map_str[200];
-        get_map_str(map_str);
-        // std::puts(map_str);
-        update_map(x, y, map_str);
-        draw_map();
-        write_all(client_socket, map_str, static_cast<size_t>(formatted));
+        const auto response{
+            "POS " + std::to_string(x) + " " + std::to_string(y) + " AREA "
+            + send_area(x, y) + "\n"
+        };
+        std::printf("[%d] %s at (%d,%d)\n", getpid(), name.c_str(), x, y);
+        if (debug) {
+            std::printf("[%d] Reply: %s", getpid(), response.c_str());
+        }
+        write_all(client_socket, response);
     }
 }
 
 // The parent only accepts and forks. Each child runs one visitor session.
 auto main(const int32_t argc, char** const argv) -> int {
+    // Flush logs before forking so buffered output is not printed twice.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::srand(static_cast<uint32_t>(getpid()));
 
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
+    if (argc == 2 && std::string{argv[1]} == "-d") {
         debug = true;
     }
 
     for (int i = 0; i < map_size; i++) {
         for (int j = 0; j < map_size; j++) {
-            map[i * map_size + j] = rand() % 8 + 1;
+            zoo_map[i][j] = static_cast<uint8_t>(std::rand() % 9 + 1);
         }
     }
-
-    map_init(map_size, map_size);
 
     const auto server_socket{create_server_socket()};
 
@@ -379,6 +294,7 @@ auto main(const int32_t argc, char** const argv) -> int {
             assert(info_signal_result != SIG_ERR);
 
             serve_player(client_socket);
+            std::printf("[%d] Client disconnected\n", getpid());
             close(client_socket);
 
             // End this child instead of returning to the parent's accept loop.
