@@ -16,7 +16,7 @@
 
 constexpr auto record_capacity{size_t{1024}};
 uint8_t zoo_map[map_size][map_size];
-bool debug = false;
+auto debug{false};
 
 struct Client final {
     int32_t socket;
@@ -42,12 +42,14 @@ struct InputBuffer final {
     size_t position{0};
 };
 
+// Sends a message to all other users on this server
+// excluding the caller
 auto broadcast_message(
     const int32_t source_descriptor,
-    const std::string& name,
+    const std::string& sender,
     const std::string& text
 ) -> void {
-    const auto message{name + ": " + text + "\n"};
+    const auto message{sender + ": " + text + "\n"};
     std::fputs(message.c_str(), stdout);
     for (const auto& client : clients) {
         // if dest != src
@@ -57,7 +59,9 @@ auto broadcast_message(
     }
 }
 
-auto serve_console([[maybe_unused]] void* const argument) -> void* {
+// This thread reads the console and broadcasts it as a message
+auto serve_console_and_broadcast_worker([[maybe_unused]] void* const argument)
+    -> void* {
     auto text{std::string{}};
     while (std::getline(std::cin, text)) {
         // stdin has its own open descriptor, so every client receives this.
@@ -153,7 +157,8 @@ auto serve_console([[maybe_unused]] void* const argument) -> void* {
 }
 
 // Run one external query and wait for its output. Keep the visitor's socket
-// open so serve_player can handle the next command after this function returns.
+// open so serve_player_worker can handle the next command after this function
+// returns.
 auto send_animal_info(const int32_t client_socket, const std::string& animal)
     -> void {
     const auto info_child{fork()};
@@ -211,9 +216,8 @@ auto send_animal_info(const int32_t client_socket, const std::string& animal)
     return area;
 }
 
-// Run in a client thread. Local session state belongs to this visitor;
-// the map and open sockets are shared by all threads.
-auto serve_player(void* const argument) -> void* {
+// This thread serves the client
+auto serve_player_worker(void* const argument) -> void* {
     const auto* const socket_argument{static_cast<const int32_t*>(argument)};
     const auto client_socket{*socket_argument};
     // The socket number is copied, so the heap argument is no longer needed.
@@ -247,7 +251,10 @@ auto serve_player(void* const argument) -> void* {
             if (command.starts_with("MSG ")) {
                 // Preserve the text after the four-byte "MSG " prefix.
                 broadcast_message(
-                    client_socket, client.name, command.substr(4)
+                    client_socket,
+                    client.name,
+                    command.substr(4) + " (" + std::to_string(client.x) + ","
+                        + std::to_string(client.y) + ")"
                 );
                 // Chat does not change position, so skip the position reply.
                 continue;
@@ -259,17 +266,17 @@ auto serve_player(void* const argument) -> void* {
                 continue;
             }
 
+            // Candidate coordinate for the next client position
             auto next_x{client.x};
             auto next_y{client.y};
 
-            // Preserve the original directions. A move at an edge stays put.
             if (command == "MOVE NORTH") {
-                if (next_y < map_size - 1) {
-                    ++next_y;
-                }
-            } else if (command == "MOVE SOUTH") {
                 if (next_y > 0) {
                     --next_y;
+                }
+            } else if (command == "MOVE SOUTH") {
+                if (next_y < map_size - 1) {
+                    ++next_y;
                 }
             } else if (command == "MOVE EAST") {
                 if (next_x < map_size - 1) {
@@ -370,12 +377,13 @@ auto main(const int32_t argc, char** const argv) -> int {
 
     const auto server_socket{create_server_socket()};
 
-    // Read the keyboard separately so main can keep accepting clients.
+    // Start keyboard reading thread
     auto console_thread{pthread_t{}};
-    const auto console_create_result{
-        pthread_create(&console_thread, nullptr, serve_console, nullptr)
-    };
+    const auto console_create_result{pthread_create(
+        &console_thread, nullptr, serve_console_and_broadcast_worker, nullptr
+    )};
     assert(console_create_result == 0);
+
     const auto console_detach_result{pthread_detach(console_thread)};
     assert(console_detach_result == 0);
 
@@ -388,7 +396,7 @@ auto main(const int32_t argc, char** const argv) -> int {
         auto thread{pthread_t{}};
         // Heap storage keeps the argument alive after this loop advances.
         const auto create_result{pthread_create(
-            &thread, nullptr, serve_player, new int32_t{client_socket}
+            &thread, nullptr, serve_player_worker, new int32_t{client_socket}
         )};
         assert(create_result == 0);
 
